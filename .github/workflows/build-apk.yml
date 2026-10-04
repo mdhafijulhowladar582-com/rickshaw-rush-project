@@ -1,1 +1,103 @@
+name: Build Android APK
 
+# Two ways to use this file:
+#  A) Upload the project files to the repo root as they are (project.godot at the top).
+#  B) Phone-friendly: upload ONLY rickshaw-rush-project.zip to the repo root; it is unpacked here.
+# Every push (and the manual "Run workflow" button) builds a debug APK.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    name: Export debug APK
+    runs-on: ubuntu-latest
+    container:
+      image: barichello/godot-ci:4.4.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate project
+        id: locate
+        run: |
+          if [ -f rickshaw-rush-project.zip ]; then
+            command -v unzip >/dev/null || (apt-get update -qq && apt-get install -y -qq unzip)
+            rm -rf game && mkdir game
+            unzip -q rickshaw-rush-project.zip -d game
+            echo "dir=game" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          elif [ -f project.godot ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No project yet (no rickshaw-rush-project.zip and no project.godot). Upload one and push again."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare Godot (export templates and Android paths)
+        if: steps.locate.outputs.found == 'true'
+        run: |
+          GV="${GODOT_VERSION:-4.4.1}"
+          T="$HOME/.local/share/godot/export_templates/${GV}.stable"
+          mkdir -p "$T" ~/.config/godot
+          if [ ! -f "$T/android_debug.apk" ]; then
+            echo "Android template missing, searching the image..."
+            FOUND="$(find /root /opt /usr /home /github -name android_debug.apk 2>/dev/null | head -n 1)"
+            if [ -n "$FOUND" ]; then
+              echo "Found templates in $(dirname "$FOUND")"
+              cp -r "$(dirname "$FOUND")"/. "$T"/
+            else
+              echo "Not found, downloading official export templates..."
+              URL="https://github.com/godotengine/godot/releases/download/${GV}-stable/Godot_v${GV}-stable_export_templates.tpz"
+              (wget -q -O /tmp/templates.tpz "$URL" || curl -fsSL -o /tmp/templates.tpz "$URL")
+              unzip -o -j -q /tmp/templates.tpz "templates/android_*" "templates/version.txt" -d "$T"
+            fi
+          fi
+          ls -lh "$T"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/lib/android-sdk}}"
+          if [ -n "$JAVA_HOME" ]; then JAVA="$JAVA_HOME"
+          elif command -v javac >/dev/null; then JAVA="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+          else JAVA=/usr/lib/jvm/java-17-openjdk-amd64; fi
+          printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\nexport/android/android_sdk_path = "%s"\nexport/android/java_sdk_path = "%s"\n' "$SDK" "$JAVA" > "$HOME/.config/godot/editor_settings-4.4.tres"
+          cp "$HOME/.config/godot/editor_settings-4.4.tres" "$HOME/.config/godot/editor_settings-4.tres"
+          echo "Godot $(godot --version)"; echo "Android SDK: $SDK"; echo "Java: $JAVA"
+
+      - name: Debug keystore
+        if: steps.locate.outputs.found == 'true'
+        run: |
+          DIR="${{ steps.locate.outputs.dir }}"
+          if [ ! -f "$DIR/debug.keystore" ]; then
+            echo "No debug.keystore in project, generating one (APKs from different runs will not install over each other)."
+            keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android -keystore "$DIR/debug.keystore" -storepass android -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+          fi
+
+      - name: Import resources
+        if: steps.locate.outputs.found == 'true'
+        run: godot --headless --verbose --path "${{ steps.locate.outputs.dir }}" --import || true
+
+      - name: Check scripts (never fails the build)
+        if: steps.locate.outputs.found == 'true'
+        run: |
+          cd "${{ steps.locate.outputs.dir }}"
+          for f in $(find scripts -name '*.gd'); do
+            echo "== $f"
+            godot --headless --path . --check-only --script "res://$f" 2>&1 | grep -E "ERROR|Parse|SCRIPT" || true
+          done
+
+      - name: Export debug APK
+        if: steps.locate.outputs.found == 'true'
+        run: |
+          export GODOT_ANDROID_KEYSTORE_DEBUG_PATH="$GITHUB_WORKSPACE/${{ steps.locate.outputs.dir }}/debug.keystore"
+          export GODOT_ANDROID_KEYSTORE_DEBUG_USER="androiddebugkey"
+          export GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD="android"
+          mkdir -p "$GITHUB_WORKSPACE/build"
+          godot --headless --verbose --path "${{ steps.locate.outputs.dir }}" --export-debug "Android" "$GITHUB_WORKSPACE/build/RickshawRush-debug.apk"
+          ls -lh "$GITHUB_WORKSPACE/build"
+
+      - name: Upload APK
+        if: steps.locate.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RickshawRush-debug-apk
+          path: build/RickshawRush-debug.apk
